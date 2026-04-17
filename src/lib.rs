@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions, read};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,6 +11,7 @@ const MAX_FILE_SIZE: u32 = 2 * 1073741824;
 // struct Key(Vec<u8>);
 
 // Format to be sent into the Bitcask file.
+#[allow(dead_code)]
 struct DataFormat {
     crc: u32,
     timestamp: u64,
@@ -21,6 +22,7 @@ struct DataFormat {
 }
 
 // KeyDirectory 
+#[allow(dead_code)]
 struct KeyDirEntry {
     file_id: u32,
     value_sz: u32,
@@ -28,7 +30,7 @@ struct KeyDirEntry {
     timestamp: u64,
 }
 
-// Appending the DataFormat entry to the current open Bitcask file, an in-memory structure called keyDir
+// After appending the DataFormat entry to the current open Bitcask file, an in-memory structure called keyDir
 // is updated.
 // TODO: In memory structure called keyDir
 struct KeyDir(HashMap<Vec<u8>, KeyDirEntry>);
@@ -118,7 +120,7 @@ impl Ronin {
         }
     }
 
-pub fn open<P: AsRef<Path>>(dir_name: P, _opts: Opts) -> Self {
+    pub fn open<P: AsRef<Path>>(dir_name: P, _opts: Opts) -> Self {
         // Calling new for now, since it mimics open logic.
         Self::new(dir_name)
     }
@@ -210,15 +212,96 @@ pub fn open<P: AsRef<Path>>(dir_name: P, _opts: Opts) -> Self {
     pub fn list_keys(&mut self) -> Vec<Vec<u8>> {
         self.key_dir.0.keys().cloned().collect()
     }
+
+    pub fn merge(&mut self) {
+        let keys: Vec<Vec<u8>> = self.key_dir.0.keys().cloned().collect();
+    
+        let merge_file_id = self.active_file_id + 1;
+        let merge_file_path = self.dir_path.join(format!("bitcask-{}.rn", merge_file_id));
+        let mut merge_file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(true)
+            .read(true)
+            .open(merge_file_path)
+            .unwrap();
+        
+        let mut new_key_dir = HashMap::new();
+        let mut current_pos: u64 = 0;
+
+        for key in keys {
+            if let Some(val) = self.get(&key) {
+                let current_time = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+
+                let key_sz = key.len() as u64;
+                let value_sz = val.len() as u64;
+                let buffer_sz = 4 + 8 + 8 + 8 + key_sz + value_sz;
+                let mut entry_buffer = Vec::with_capacity(buffer_sz as usize);
+
+                entry_buffer.extend_from_slice(&[0; 4]);
+                entry_buffer.extend_from_slice(&current_time.to_le_bytes());
+                entry_buffer.extend_from_slice(&key_sz.to_le_bytes());
+                entry_buffer.extend_from_slice(&value_sz.to_le_bytes());
+                entry_buffer.extend_from_slice(&key);
+                entry_buffer.extend(&val);
+
+                let mut hasher = Hasher::new();
+                hasher.update(&entry_buffer[4..]);
+
+                let checksum = hasher.finalize();
+                entry_buffer[0..4].copy_from_slice(&checksum.to_le_bytes());
+
+                // current_pos = merge_file.stream_position().unwrap();
+
+                merge_file.write_all(&entry_buffer).unwrap();
+
+                let entry = KeyDirEntry {
+                    file_id: merge_file_id,
+                    value_sz: value_sz as u32,
+                    value_pos: current_pos,
+                    timestamp: current_time,
+                };
+                new_key_dir.insert(key.clone(), entry);
+                current_pos += entry_buffer.len() as u64;
+            }
+        }
+        self.active_file = merge_file;
+        self.active_file_id = merge_file_id;
+        self.key_dir.0 = new_key_dir;
+
+        let ronin_dir = fs::read_dir(&self.dir_path).unwrap();
+        
+        for dir_entry in ronin_dir {
+            let file_path = dir_entry.unwrap().path();
+
+            if let Some(file_name) = file_path.file_name().and_then(|n| n.to_str()) {
+                // Check if it's a ronin file
+                if file_name.starts_with("bitcask-") && file_name.ends_with(".rn") {
+                    let id_str = &file_name["bitcask-".len()..(file_name.len() -3)];
+                    if let Ok(file_id) = id_str.parse::<u32>() {
+                        if file_id < merge_file_id {
+                            fs::remove_file(file_path).unwrap();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn test_put_retrieves_correct_data() {
-        let mut db = Ronin::new("bitcask");
+        let dir = tempdir().unwrap();
+        let mut db = Ronin::new(dir.path());
 
         let key1 = b"kenechukwu".to_vec();
         let val1 = b"ifediora".to_vec();
@@ -231,7 +314,8 @@ mod tests {
 
     #[test]
     fn test_delete_removes_key() {
-        let mut db = Ronin::new("bitcask");
+        let dir = tempdir().unwrap();
+        let mut db = Ronin::new(dir.path());
 
         let key = b"Shinske".to_vec();
         let val = b"Nakamura".to_vec();
@@ -248,7 +332,8 @@ mod tests {
     
     #[test]
     fn test_recovery_reloads_data_after_restart() {
-        let db_file = "bitcask";
+        let dir = tempdir().unwrap();
+        let db_file = dir.path();
         let key = b"ghost".to_vec();
         let val = b"tsushima".to_vec();
 
@@ -260,6 +345,44 @@ mod tests {
         let mut db2 = Ronin::new(db_file);
 
         let retrieved = db2.get(&key);
-        assert_eq!(retrieved, Some(val))
+        assert_eq!(retrieved, Some(val));
+    }
+
+    #[test]
+    fn test_merge_compacts_data_files() {
+        let dir = tempdir().unwrap();
+        let db_file = dir.path();
+
+        let key = b"A".to_vec();
+        let val1 = b"foo".to_vec();
+        let val2 = b"bar".to_vec();
+        let val3 = b"baz".to_vec();
+
+        let mut db = Ronin::new(db_file);
+        
+        // Write the same key multiple times to create stale records
+        db.put(key.clone(), val1);
+        db.put(key.clone(), val2);
+        db.put(key.clone(), val3.clone()); // "baz" is the freshest data
+
+        // Perform the merge
+        db.merge();
+
+        // Verify the latest value is intact
+        let retrieved = db.get(&key);
+        assert_eq!(retrieved, Some(val3));
+
+        // Verify there is only one .rn file left after cleanup
+        let mut rn_count = 0;
+        if let Ok(entries) = std::fs::read_dir(db_file) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("rn") {
+                    rn_count += 1;
+                }
+            }
+        }
+        
+        assert_eq!(rn_count, 1, "Merge should leave exactly 1 .rn file");
     }
 }
