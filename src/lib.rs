@@ -17,8 +17,8 @@ struct DataFormat {
     timestamp: u64,
     key_sz: u64,
     value_sz: u64,
-    key: Vec<u8>,
-    value: Vec<u8>,
+    key: String,
+    value: String,
 }
 
 // KeyDirectory 
@@ -33,7 +33,7 @@ struct KeyDirEntry {
 // After appending the DataFormat entry to the current open Bitcask file, an in-memory structure called keyDir
 // is updated.
 // TODO: In memory structure called keyDir
-struct KeyDir(HashMap<Vec<u8>, KeyDirEntry>);
+struct KeyDir(HashMap<String, KeyDirEntry>);
 
 pub struct Ronin {
     key_dir: KeyDir,
@@ -61,7 +61,7 @@ impl Ronin {
         let dir_path_buf = dir_path.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir_path_buf).unwrap();
 
-        let mut memory_map: HashMap<Vec<u8>, KeyDirEntry> = HashMap::new();
+        let mut memory_map: HashMap<Vec<String>, KeyDirEntry> = HashMap::new();
         let mut max_file_id: u32 = 0;
 
         // 1. Find all data files and sort them by ID
@@ -178,7 +178,7 @@ impl Ronin {
     }
 
     // Returns true if the filesize is more than or equal to maximum filesize and false if otherwise 
-    fn check_file_threshold(&mut self) -> bool {
+    fn reach_file_threshold(&mut self) -> bool {
         let current_pos = self.active_file.stream_position().unwrap();
 
         if current_pos  < MAX_FILE_SIZE {
@@ -242,7 +242,7 @@ impl Ronin {
 
         let mut current_pos = self.active_file.stream_position().unwrap();
 
-        if self.check_file_threshold() {
+        if self.reach_file_threshold() {
             current_pos = self.rotate_active_file();
         }
 
@@ -255,30 +255,33 @@ impl Ronin {
             timestamp: timestamp,
         };
 
-        self.key_dir.0.insert(key.as_bytes().to_vec().clone(), entry);
+        self.key_dir.0.insert(key.to_string(), entry);
     }
 
     pub fn put(&mut self, key: &str, value: &str) {
         self.write(key, value);
     }
 
-    pub fn get(&mut self, key: &str) -> Option<&str> {
-        let entry = self.key_dir.0.get(key.as_bytes())?;
+    pub fn get(&mut self, key: &str) -> Option<String> {
+        let entry = self.key_dir.0.get(key)?;
         let val_position = entry.value_pos;
-        let val_size = entry.value_sz;
+        let val_size = entry.value_sz as usize;
         let val_offset = val_position + 4 + 8 + 8 + 8 + (key.len() as u64);
 
-        let mut val_buffer= vec![0u8; val_size as usize];
+        let mut val_buffer= String::with_capacity(val_size);
+        let bytes_buffer = unsafe {
+            val_buffer.as_bytes_mut()
+        };
         
         if entry.file_id == self.active_file_id {
             self.active_file.seek(SeekFrom::Start(val_offset)).unwrap();
-            self.active_file.read_exact(&mut val_buffer).unwrap();
+            self.active_file.read_exact(bytes_buffer).unwrap();
         } else {
-            let old_file_path = self.dir_path.join(format!("bitcask-{}.rn", entry.file_id));
+            let old_file_path = self.dir_path.join(format!("{}_{}.rn", entry.timestamp, entry.file_id));
 
             let mut old_file = File::open(old_file_path).unwrap();
             old_file.seek(SeekFrom::Start(val_offset)).unwrap();
-            old_file.read_exact(&mut val_buffer).unwrap();
+            old_file.read_exact(bytes_buffer).unwrap();
         }
 
         Some(val_buffer)
@@ -286,19 +289,23 @@ impl Ronin {
 
     pub fn delete(&mut self, key: &str) {
         let tbs_value = "GONE";
-        self.put(key.clone(), tbs_value);
-        self.key_dir.0.remove(key.as_bytes());
+        self.put(key, tbs_value);
+        self.key_dir.0.remove(key);
     }
 
-    pub fn list_keys(&mut self) -> Vec<Vec<u8>> {
+    pub fn list_keys(&mut self) -> Vec<String> {
         self.key_dir.0.keys().cloned().collect()
     }
 
     pub fn merge(&mut self) {
-        let keys: Vec<Vec<u8>> = self.key_dir.0.keys().cloned().collect();
+        let keys: Vec<String> = self.key_dir.0.keys().cloned().collect();
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
     
         let merge_file_id = self.active_file_id + 1;
-        let merge_file_path = self.dir_path.join(format!("bitcask-{}.rn", merge_file_id));
+        let merge_file_path = self.dir_path.join(format!("{}_{}.rn", timestamp, merge_file_id));
         let mut merge_file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -307,7 +314,7 @@ impl Ronin {
             .open(merge_file_path)
             .unwrap();
         
-        let hint_file_path = self.dir_path.join(format!("bitcask-{}.hint", merge_file_id));
+        let hint_file_path = self.dir_path.join(format!("{}_{}.hint", timestamp, merge_file_id));
         let mut hint_file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -321,11 +328,6 @@ impl Ronin {
 
         for key in keys {
             if let Some(val) = self.get(&key) {
-                let current_time = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-
                 let key_sz = key.len() as u64;
                 let value_sz = val.len() as u64;
                 let buffer_sz = 4 + 8 + 8 + 8 + key_sz + value_sz;
@@ -335,18 +337,18 @@ impl Ronin {
 
                 // Constructing the buffer for our merge file.
                 entry_buffer.extend_from_slice(&[0; 4]);
-                entry_buffer.extend_from_slice(&current_time.to_le_bytes());
+                entry_buffer.extend_from_slice(&timestamp.to_le_bytes());
                 entry_buffer.extend_from_slice(&key_sz.to_le_bytes());
                 entry_buffer.extend_from_slice(&value_sz.to_le_bytes());
-                entry_buffer.extend_from_slice(&key);
-                entry_buffer.extend(&val);
+                entry_buffer.extend_from_slice(&key.as_bytes());
+                entry_buffer.extend(&mut val.as_bytes().iter());
 
                 // Constructing the buffer for our hint file.
-                hint_buffer.extend_from_slice(&current_time.to_le_bytes());
+                hint_buffer.extend_from_slice(&timestamp.to_le_bytes());
                 hint_buffer.extend_from_slice(&key_sz.to_le_bytes());
                 hint_buffer.extend_from_slice(&value_sz.to_le_bytes());
                 hint_buffer.extend_from_slice(&current_pos.to_le_bytes());
-                hint_buffer.extend_from_slice(&key);
+                hint_buffer.extend_from_slice(&key.as_bytes());
 
                 hint_file.write_all(&hint_buffer).unwrap();
 
@@ -364,7 +366,7 @@ impl Ronin {
                     file_id: merge_file_id,
                     value_sz: value_sz as u32,
                     value_pos: current_pos,
-                    timestamp: current_time,
+                    timestamp: timestamp,
                 };
                 new_key_dir.insert(key.clone(), entry);
                 current_pos += entry_buffer.len() as u64;
@@ -383,8 +385,10 @@ impl Ronin {
 
             if let Some(file_name) = file_path.file_name().and_then(|n| n.to_str()) {
                 // Check if it's a ronin file
-                if file_name.starts_with("bitcask-") && file_name.ends_with(".rn") {
-                    let id_str = &file_name["bitcask-".len()..(file_name.len() -3)];
+                if file_name.ends_with(".rn") {
+                    let timestamp_string = timestamp.to_string();
+                    let timestamp_on_file = format!("{}_", &timestamp_string);
+                    let id_str = &file_name[timestamp_on_file.len()..(file_name.len() -3)];
                     if let Ok(file_id) = id_str.parse::<u32>() {
                         if file_id < merge_file_id {
                             fs::remove_file(file_path).unwrap();
