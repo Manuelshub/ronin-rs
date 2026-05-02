@@ -1,10 +1,9 @@
+use crc32fast::Hasher;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::vec;
-use crc32fast::Hasher;
 
 // Every Active file threshold.
 const MAX_FILE_SIZE: u64 = 2 * 1073741824;
@@ -21,7 +20,7 @@ struct DataFormat {
     value: String,
 }
 
-// KeyDirectory 
+// KeyDirectory
 #[allow(dead_code)]
 struct KeyDirEntry {
     file_id: u32,
@@ -56,25 +55,33 @@ pub struct Ronin {
 //     }
 // }
 
+pub fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
 impl Ronin {
     pub fn new<P: AsRef<Path>>(dir_path: P) -> Self {
         let dir_path_buf = dir_path.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir_path_buf).unwrap();
 
-        let mut memory_map: HashMap<Vec<String>, KeyDirEntry> = HashMap::new();
+        let mut memory_map: HashMap<String, KeyDirEntry> = HashMap::new();
         let mut max_file_id: u32 = 0;
 
         // 1. Find all data files and sort them by ID
-        let mut data_files: Vec<u32> = Vec::new();
+        let mut data_files: Vec<String> = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&dir_path_buf) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_file() {
                     if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                        if file_name.starts_with("bitcask-") && file_name.ends_with(".rn") {
-                            let id_str = &file_name["bitcask-".len()..(file_name.len() - 3)];
+                        if file_name.ends_with(".rn") {
+                            let timestamp = &file_name[..(file_name.len() - 5)];
+                            let id_str = &file_name[(timestamp.len() + 1)..(file_name.len() - 3)];
                             if let Ok(file_id) = id_str.parse::<u32>() {
-                                data_files.push(file_id);
+                                data_files.push(file_name[..(file_name.len() - 3)].to_string());
                                 if file_id > max_file_id {
                                     max_file_id = file_id;
                                 }
@@ -84,58 +91,69 @@ impl Ronin {
                 }
             }
         }
-        
+
         data_files.sort_unstable(); // E.g., [0, 1, 2]
-        
+
         // If there are no data files at all, start with ID 0
         if data_files.is_empty() {
-             data_files.push(0);
+            data_files.push("".to_string());
         }
 
         // 2. Rebuild the KeyDir for each file in chronological order
-        for file_id in data_files {
-            let hint_path = dir_path_buf.join(format!("bitcask-{}.hint", file_id));
-            let data_path = dir_path_buf.join(format!("bitcask-{}.rn", file_id));
-            
+        for file_metadata in data_files {
+            let timestamp = &file_metadata[..(file_metadata.len() - 2)];
+            let id_str = &file_metadata[(timestamp.len() + 1)..];
+            let file_id = id_str.parse::<u32>().unwrap();
+            let hint_path = dir_path_buf.join(format!("{}.hint", file_metadata));
+            let data_path = dir_path_buf.join(format!("{}.rn", file_metadata));
+
             // Prefer reading from the .hint file if it exists!
             if hint_path.exists() {
                 if let Ok(mut hint_file) = File::open(&hint_path) {
                     loop {
                         let mut header_buff = [0u8; 32]; // Timestamp(8) + KeySz(8) + ValSz(8) + Pos(8)
-                        
+
                         if let Err(e) = hint_file.read_exact(&mut header_buff) {
-                            if e.kind() == std::io::ErrorKind::UnexpectedEof { break; }
+                            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                                break;
+                            }
                             panic!("Corrupted hint file headers! {}", e);
                         }
-                        
+
                         let timestamp = u64::from_le_bytes(header_buff[0..8].try_into().unwrap());
                         let key_sz = u64::from_le_bytes(header_buff[8..16].try_into().unwrap());
                         let value_sz = u64::from_le_bytes(header_buff[16..24].try_into().unwrap());
                         let value_pos = u64::from_le_bytes(header_buff[24..32].try_into().unwrap());
-                        
-                        let mut key = vec![0u8; key_sz as usize];
-                        hint_file.read_exact(&mut key).unwrap();
-                        
+
+                        let mut key = String::with_capacity(key_sz as usize);
+                        hint_file.read_exact(&mut key.as_bytes()).unwrap();
+
                         if value_sz == 0 {
                             memory_map.remove(&key);
                         } else {
-                            let entry = KeyDirEntry { file_id, value_sz: value_sz as u32, value_pos, timestamp };
+                            let entry = KeyDirEntry {
+                                file_id,
+                                value_sz: value_sz as u32,
+                                value_pos,
+                                timestamp,
+                            };
                             memory_map.insert(key, entry);
                         }
                     }
                     continue;
                 }
             }
-            
-            
+
             if data_path.exists() {
-               if let Ok(mut reader) = File::open(&data_path) {
+                if let Ok(mut reader) = File::open(&data_path) {
                     loop {
                         let entry_pos = reader.stream_position().unwrap();
                         let mut header_buff = [0u8; 28]; // CRC(4) + Timestamp(8) + KeySz(8) + ValSz(8)
 
                         if let Err(e) = reader.read_exact(&mut header_buff) {
-                            if e.kind() == std::io::ErrorKind::UnexpectedEof { break; }
+                            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                                break;
+                            }
                             panic!("Corrupted data file! Error reading headers: {}", e);
                         }
 
@@ -143,19 +161,24 @@ impl Ronin {
                         let key_sz = u64::from_le_bytes(header_buff[12..20].try_into().unwrap());
                         let value_sz = u64::from_le_bytes(header_buff[20..28].try_into().unwrap());
 
-                        let mut key = vec![0u8; key_sz as usize];
-                        reader.read_exact(&mut key).unwrap();
-                        
+                        let mut key = String::with_capacity(key_sz as usize);
+                        reader.read_exact(&mut key.as_bytes()).unwrap();
+
                         reader.seek(SeekFrom::Current(value_sz as i64)).unwrap();
 
                         if value_sz == 0 {
                             memory_map.remove(&key);
                         } else {
-                            let entry = KeyDirEntry { file_id, value_sz: value_sz as u32, value_pos: entry_pos, timestamp };
+                            let entry = KeyDirEntry {
+                                file_id,
+                                value_sz: value_sz as u32,
+                                value_pos: entry_pos,
+                                timestamp,
+                            };
                             memory_map.insert(key, entry);
                         }
                     }
-               }
+                }
             }
         }
 
@@ -177,11 +200,11 @@ impl Ronin {
         }
     }
 
-    // Returns true if the filesize is more than or equal to maximum filesize and false if otherwise 
-    fn reach_file_threshold(&mut self) -> bool {
+    // Returns true if the filesize is more than or equal to maximum filesize and false if otherwise
+    fn reach_file_threshold(&mut self, buffer_sz: u64) -> bool {
         let current_pos = self.active_file.stream_position().unwrap();
 
-        if current_pos  < MAX_FILE_SIZE {
+        if (current_pos + buffer_sz) < MAX_FILE_SIZE {
             false
         } else {
             true
@@ -189,14 +212,13 @@ impl Ronin {
     }
 
     fn rotate_active_file(&mut self) -> u64 {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-            
+        let timestamp = current_timestamp();
+
         self.active_file_id += 1;
 
-        let data_file_path = self.dir_path.join(format!("{}_{}.rn", timestamp, self.active_file_id));
+        let data_file_path = self
+            .dir_path
+            .join(format!("{}_{}.rn", timestamp, self.active_file_id));
         let new_active_file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -215,10 +237,7 @@ impl Ronin {
     }
 
     pub fn write(&mut self, key: &str, value: &str) {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let timestamp = current_timestamp();
 
         let buffer_sz = 4 + 8 + 8 + 8 + key.len() + value.len();
         let mut entry_buffer: Vec<u8> = Vec::with_capacity(buffer_sz);
@@ -226,7 +245,7 @@ impl Ronin {
         let timestamp_bytes = timestamp.to_le_bytes();
         let key_sz_bytes = key.len().to_le_bytes();
         let val_sz_bytes = value.len().to_le_bytes();
-        
+
         entry_buffer.extend_from_slice(&[0; 4]);
         entry_buffer.extend_from_slice(&timestamp_bytes);
         entry_buffer.extend_from_slice(&key_sz_bytes);
@@ -242,13 +261,13 @@ impl Ronin {
 
         let mut current_pos = self.active_file.stream_position().unwrap();
 
-        if self.reach_file_threshold() {
+        if self.reach_file_threshold(entry_buffer.len() as u64) {
             current_pos = self.rotate_active_file();
         }
 
         self.active_file.write_all(&entry_buffer).unwrap();
 
-        let entry = KeyDirEntry{
+        let entry = KeyDirEntry {
             file_id: self.active_file_id,
             value_sz: value.len() as u32,
             value_pos: current_pos,
@@ -268,23 +287,24 @@ impl Ronin {
         let val_size = entry.value_sz as usize;
         let val_offset = val_position + 4 + 8 + 8 + 8 + (key.len() as u64);
 
-        let mut val_buffer= String::with_capacity(val_size);
-        let bytes_buffer = unsafe {
-            val_buffer.as_bytes_mut()
-        };
-        
+        let mut val_buffer = vec![0u8; val_size];
+        // let bytes_buffer = unsafe { val_buffer.as_bytes_mut() };
+
         if entry.file_id == self.active_file_id {
             self.active_file.seek(SeekFrom::Start(val_offset)).unwrap();
-            self.active_file.read_exact(bytes_buffer).unwrap();
+            self.active_file.read_exact(&mut val_buffer).unwrap();
         } else {
-            let old_file_path = self.dir_path.join(format!("{}_{}.rn", entry.timestamp, entry.file_id));
+            let old_file_path = self
+                .dir_path
+                .join(format!("{}_{}.rn", entry.timestamp, entry.file_id));
 
             let mut old_file = File::open(old_file_path).unwrap();
             old_file.seek(SeekFrom::Start(val_offset)).unwrap();
-            old_file.read_exact(bytes_buffer).unwrap();
+            old_file.read_exact(&mut val_buffer).unwrap();
         }
+        let value = String::from_utf8(val_buffer).unwrap();
 
-        Some(val_buffer)
+        Some(value)
     }
 
     pub fn delete(&mut self, key: &str) {
@@ -299,13 +319,12 @@ impl Ronin {
 
     pub fn merge(&mut self) {
         let keys: Vec<String> = self.key_dir.0.keys().cloned().collect();
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-    
+        let timestamp = current_timestamp();
+
         let merge_file_id = self.active_file_id + 1;
-        let merge_file_path = self.dir_path.join(format!("{}_{}.rn", timestamp, merge_file_id));
+        let merge_file_path = self
+            .dir_path
+            .join(format!("{}_{}.rn", timestamp, merge_file_id));
         let mut merge_file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -313,8 +332,10 @@ impl Ronin {
             .read(true)
             .open(merge_file_path)
             .unwrap();
-        
-        let hint_file_path = self.dir_path.join(format!("{}_{}.hint", timestamp, merge_file_id));
+
+        let hint_file_path = self
+            .dir_path
+            .join(format!("{}_{}.hint", timestamp, merge_file_id));
         let mut hint_file = OpenOptions::new()
             .create(true)
             .write(true)
@@ -378,7 +399,7 @@ impl Ronin {
         self.key_dir.0 = new_key_dir;
 
         let ronin_dir = fs::read_dir(&self.dir_path).unwrap();
-        
+
         // We loop through the ronin directory to get each directory entry.
         for dir_entry in ronin_dir {
             let file_path = dir_entry.unwrap().path();
@@ -386,9 +407,10 @@ impl Ronin {
             if let Some(file_name) = file_path.file_name().and_then(|n| n.to_str()) {
                 // Check if it's a ronin file
                 if file_name.ends_with(".rn") {
+                    // Using the timestamp to get the file_id
                     let timestamp_string = timestamp.to_string();
                     let timestamp_on_file = format!("{}_", &timestamp_string);
-                    let id_str = &file_name[timestamp_on_file.len()..(file_name.len() -3)];
+                    let id_str = &file_name[timestamp_on_file.len()..(file_name.len() - 3)];
                     if let Ok(file_id) = id_str.parse::<u32>() {
                         if file_id < merge_file_id {
                             fs::remove_file(file_path).unwrap();
@@ -398,7 +420,6 @@ impl Ronin {
             }
         }
     }
-
 }
 
 #[cfg(test)]
@@ -437,7 +458,7 @@ mod tests {
         let retrieved = db.get(key);
         assert_eq!(retrieved, None);
     }
-    
+
     #[test]
     fn test_recovery_reloads_data_after_restart() {
         let dir = tempdir().unwrap();
@@ -467,7 +488,7 @@ mod tests {
         let val3 = "baz";
 
         let mut db = Ronin::new(db_file);
-        
+
         // Write the same key multiple times to create stale records
         db.put(key.clone(), val1);
         db.put(key.clone(), val2);
@@ -490,7 +511,7 @@ mod tests {
                 }
             }
         }
-        
+
         assert_eq!(rn_count, 1, "Merge should leave exactly 1 .rn file");
     }
 
@@ -500,7 +521,7 @@ mod tests {
         let mut db = Ronin::new(dir.path());
         let mut idx = 0;
         let key = "always_ronin";
-        
+
         while idx < 100 {
             let format = format!("Data-{}", idx);
             let val = format.as_str();
@@ -508,7 +529,7 @@ mod tests {
             db.put(key, val);
             idx += 1;
         }
-        
+
         let last_val = db.get(&key);
         assert_eq!(last_val, Some("Data-99"));
     }
