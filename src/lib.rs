@@ -38,6 +38,7 @@ pub struct Ronin {
     key_dir: KeyDir,
     active_file: File,
     active_file_id: u32,
+    active_file_timestamp: u64,
     dir_path: PathBuf,
 }
 
@@ -69,6 +70,7 @@ impl Ronin {
 
         let mut memory_map: HashMap<String, KeyDirEntry> = HashMap::new();
         let mut max_file_id: u32 = 0;
+        let mut max_file_timestamp: u64 = 0;
 
         // 1. Find all data files and sort them by ID
         let mut data_files: Vec<String> = Vec::new();
@@ -77,13 +79,14 @@ impl Ronin {
                 let path = entry.path();
                 if path.is_file() {
                     if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                        if file_name.ends_with(".rn") {
-                            let timestamp = &file_name[..(file_name.len() - 5)];
-                            let id_str = &file_name[(timestamp.len() + 1)..(file_name.len() - 3)];
-                            if let Ok(file_id) = id_str.parse::<u32>() {
-                                data_files.push(file_name[..(file_name.len() - 3)].to_string());
-                                if file_id > max_file_id {
-                                    max_file_id = file_id;
+                        if let Some(stem) = file_name.strip_suffix(".rn") {
+                            if let Some((ts, id_str)) = stem.rsplit_once('_') {
+                                if let Ok(file_id) = id_str.parse::<u32>() {
+                                    data_files.push(stem.to_string());
+                                    if file_id >= max_file_id {
+                                        max_file_id = file_id;
+                                        max_file_timestamp = ts.parse().unwrap_or(0);
+                                    }
                                 }
                             }
                         }
@@ -94,16 +97,16 @@ impl Ronin {
 
         data_files.sort_unstable(); // E.g., [0, 1, 2]
 
-        // If there are no data files at all, start with ID 0
+        // If there are no data files, use the current time for the fresh file
         if data_files.is_empty() {
-            data_files.push("".to_string());
+            max_file_timestamp = current_timestamp();
         }
 
         // 2. Rebuild the KeyDir for each file in chronological order
-        for file_metadata in data_files {
-            let timestamp = &file_metadata[..(file_metadata.len() - 2)];
-            let id_str = &file_metadata[(timestamp.len() + 1)..];
-            let file_id = id_str.parse::<u32>().unwrap();
+        for file_metadata in &data_files {
+            let (ts, id_str) = file_metadata.rsplit_once('_').unwrap();
+            let file_id: u32 = id_str.parse().unwrap();
+            let file_timestamp: u64 = ts.parse().unwrap();
             let hint_path = dir_path_buf.join(format!("{}.hint", file_metadata));
             let data_path = dir_path_buf.join(format!("{}.rn", file_metadata));
 
@@ -120,13 +123,15 @@ impl Ronin {
                             panic!("Corrupted hint file headers! {}", e);
                         }
 
-                        let timestamp = u64::from_le_bytes(header_buff[0..8].try_into().unwrap());
+                        let _entry_timestamp = u64::from_le_bytes(header_buff[0..8].try_into().unwrap());
                         let key_sz = u64::from_le_bytes(header_buff[8..16].try_into().unwrap());
                         let value_sz = u64::from_le_bytes(header_buff[16..24].try_into().unwrap());
                         let value_pos = u64::from_le_bytes(header_buff[24..32].try_into().unwrap());
 
-                        let mut key = String::with_capacity(key_sz as usize);
-                        hint_file.read_exact(&mut key.as_bytes()).unwrap();
+                        let mut key_bytes = vec![0u8; key_sz as usize];
+                        hint_file.read_exact(&mut key_bytes).unwrap();
+
+                        let key = String::from_utf8(key_bytes).unwrap();
 
                         if value_sz == 0 {
                             memory_map.remove(&key);
@@ -135,7 +140,7 @@ impl Ronin {
                                 file_id,
                                 value_sz: value_sz as u32,
                                 value_pos,
-                                timestamp,
+                                timestamp: file_timestamp,
                             };
                             memory_map.insert(key, entry);
                         }
@@ -157,12 +162,13 @@ impl Ronin {
                             panic!("Corrupted data file! Error reading headers: {}", e);
                         }
 
-                        let timestamp = u64::from_le_bytes(header_buff[4..12].try_into().unwrap());
+                        let _entry_timestamp = u64::from_le_bytes(header_buff[4..12].try_into().unwrap());
                         let key_sz = u64::from_le_bytes(header_buff[12..20].try_into().unwrap());
                         let value_sz = u64::from_le_bytes(header_buff[20..28].try_into().unwrap());
 
-                        let mut key = String::with_capacity(key_sz as usize);
-                        reader.read_exact(&mut key.as_bytes()).unwrap();
+                        let mut key_bytes = vec![0u8; key_sz as usize];
+                        reader.read_exact(&mut key_bytes).unwrap();
+                        let key = String::from_utf8(key_bytes).unwrap();
 
                         reader.seek(SeekFrom::Current(value_sz as i64)).unwrap();
 
@@ -173,7 +179,7 @@ impl Ronin {
                                 file_id,
                                 value_sz: value_sz as u32,
                                 value_pos: entry_pos,
-                                timestamp,
+                                timestamp: file_timestamp,
                             };
                             memory_map.insert(key, entry);
                         }
@@ -182,7 +188,7 @@ impl Ronin {
             }
         }
 
-        let active_file_path = dir_path_buf.join(format!("bitcask-{}.rn", max_file_id));
+        let active_file_path = dir_path_buf.join(format!("{}_{}.rn", max_file_timestamp, max_file_id));
         let active_file = OpenOptions::new()
             .read(true)
             .create(true)
@@ -196,6 +202,7 @@ impl Ronin {
             key_dir,
             active_file,
             active_file_id: max_file_id,
+            active_file_timestamp: max_file_timestamp,
             dir_path: dir_path_buf,
         }
     }
@@ -215,6 +222,7 @@ impl Ronin {
         let timestamp = current_timestamp();
 
         self.active_file_id += 1;
+        self.active_file_timestamp = timestamp;
 
         let data_file_path = self
             .dir_path
@@ -271,7 +279,7 @@ impl Ronin {
             file_id: self.active_file_id,
             value_sz: value.len() as u32,
             value_pos: current_pos,
-            timestamp: timestamp,
+            timestamp: self.active_file_timestamp,
         };
 
         self.key_dir.0.insert(key.to_string(), entry);
@@ -288,7 +296,6 @@ impl Ronin {
         let val_offset = val_position + 4 + 8 + 8 + 8 + (key.len() as u64);
 
         let mut val_buffer = vec![0u8; val_size];
-        // let bytes_buffer = unsafe { val_buffer.as_bytes_mut() };
 
         if entry.file_id == self.active_file_id {
             self.active_file.seek(SeekFrom::Start(val_offset)).unwrap();
@@ -308,8 +315,7 @@ impl Ronin {
     }
 
     pub fn delete(&mut self, key: &str) {
-        let tbs_value = "GONE";
-        self.put(key, tbs_value);
+        self.put(key,"");
         self.key_dir.0.remove(key);
     }
 
@@ -396,6 +402,7 @@ impl Ronin {
         // After the merge operation, we update our Ronin structure with the current merge file, merge_file_id and the new_key_dir structure.
         self.active_file = merge_file;
         self.active_file_id = merge_file_id;
+        self.active_file_timestamp = timestamp;
         self.key_dir.0 = new_key_dir;
 
         let ronin_dir = fs::read_dir(&self.dir_path).unwrap();
@@ -405,15 +412,13 @@ impl Ronin {
             let file_path = dir_entry.unwrap().path();
 
             if let Some(file_name) = file_path.file_name().and_then(|n| n.to_str()) {
-                // Check if it's a ronin file
-                if file_name.ends_with(".rn") {
-                    // Using the timestamp to get the file_id
-                    let timestamp_string = timestamp.to_string();
-                    let timestamp_on_file = format!("{}_", &timestamp_string);
-                    let id_str = &file_name[timestamp_on_file.len()..(file_name.len() - 3)];
-                    if let Ok(file_id) = id_str.parse::<u32>() {
-                        if file_id < merge_file_id {
-                            fs::remove_file(file_path).unwrap();
+                // Check if it's a ronin data file
+                if let Some(stem) = file_name.strip_suffix(".rn") {
+                    if let Some((_ts, id_str)) = stem.rsplit_once('_') {
+                        if let Ok(file_id) = id_str.parse::<u32>() {
+                            if file_id < merge_file_id {
+                                fs::remove_file(&file_path).unwrap();
+                            }
                         }
                     }
                 }
@@ -438,7 +443,7 @@ mod tests {
 
         let retrieved = db.get(key1);
 
-        assert_eq!(retrieved, Some(val1));
+        assert_eq!(retrieved, Some(val1.to_string()));
     }
 
     #[test]
@@ -449,8 +454,8 @@ mod tests {
         let key = "Shinske";
         let val = "Nakamura";
 
-        db.put(key.clone(), val);
-        assert_eq!(db.get(key), Some(val));
+        db.put(key, val);
+        assert_eq!(db.get(key), Some(val.to_string()));
 
         // Delete the key!
         db.delete(key);
@@ -474,7 +479,7 @@ mod tests {
         let mut db2 = Ronin::new(db_file);
 
         let retrieved = db2.get(key);
-        assert_eq!(retrieved, Some(val));
+        assert_eq!(retrieved, Some(val.to_string()));
     }
 
     #[test]
@@ -490,8 +495,8 @@ mod tests {
         let mut db = Ronin::new(db_file);
 
         // Write the same key multiple times to create stale records
-        db.put(key.clone(), val1);
-        db.put(key.clone(), val2);
+        db.put(key, val1);
+        db.put(key, val2);
         db.put(key, val3); // "baz" is the freshest data
 
         // Perform the merge
@@ -499,7 +504,7 @@ mod tests {
 
         // Verify the latest value is intact
         let retrieved = db.get(key);
-        assert_eq!(retrieved, Some(val3));
+        assert_eq!(retrieved, Some(val3.to_string()));
 
         // Verify there is only one .rn file left after cleanup
         let mut rn_count = 0;
@@ -531,6 +536,6 @@ mod tests {
         }
 
         let last_val = db.get(&key);
-        assert_eq!(last_val, Some("Data-99"));
+        assert_eq!(last_val, Some("Data-99".to_string()));
     }
 }
