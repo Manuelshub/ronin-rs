@@ -273,6 +273,7 @@ impl Ronin {
             current_pos = self.rotate_active_file();
         }
 
+        self.active_file.lock().unwrap();
         self.active_file.write_all(&entry_buffer).unwrap();
 
         let entry = KeyDirEntry {
